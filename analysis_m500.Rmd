@@ -1,0 +1,478 @@
+---
+title: "Input Uncertainty in Simulation Analytics"
+output:
+  html_document: default
+---
+
+```{r setup r, include=FALSE}
+
+# clear environment
+rm(list=ls())
+
+# clear console 
+cat("\014")
+
+# source simulation arguments
+source("arguments.R")
+
+# load results
+load("results_m500.RData")
+
+# load libraries
+library(ggplot2)
+library(reticulate)
+library(BSDA)
+
+```
+
+```{python setup python, include=FALSE}
+
+# import packages
+import numpy as np
+from sklearn import tree, linear_model, neighbors
+from sklearn.model_selection import train_test_split, cross_val_score, ShuffleSplit
+from sklearn.metrics import f1_score
+
+```
+
+
+```{r data wrangling, include=FALSE}
+
+# set burn-in 
+burn <- 100
+
+# prep data
+X <- sim_MLEs$state[-1:-burn, ]
+y <- sim_MLEs$time_in_system[-1:-burn]
+
+# get dimensions
+dimX <- dim(X)
+
+# convert y to binary
+threshold <- 2.5
+y <- as.numeric(y > threshold)
+
+# check class balance
+balance <- table(y) / length(y)
+
+```
+
+## Introduction
+
+* Network of three consecutive M/M/1 queues, where final node undergoes breakdown (maintenance?)
+* Input parameters are arrival rate (Poisson), and three service rates (exponential).
+* Intervals between breakdown are constant, as is the time needed to repair.
+* State data measures whether each server is busy, the number in each queue, and whether there is a breakdown at the final node for each arrival.
+* Output data measures the time in the system.
+* Classify whether time in system will be above/below some threshold for each arrival.
+
+## Estimated Parameters
+
+* True arrival rate is `r lambda`, and true service rates are `r mu[1]`, `r mu[2]`, `r mu[3]`.
+* Estimate input parameters using maximum likelihood estimation on `r m` observations each.
+* Breakdown intervals are `r MaintInterval` time periods, with `r FixTime` time periods required to repair. 
+* Run simulation for `r tend` time periods.
+* Record state and output data, discard first `r burn` observations as burn-in
+* Use threshold of `r threshold` to classify time in the system.
+* Total of `r dimX[1]` observations,  approximately `r 100*round(balance[2], 3)`% above threshold. 
+
+```{python prep data python, echo=FALSE}
+
+# load R data as np arrays and reshape
+dimX = r.dimX
+X = np.reshape(np.array(r.X), (dimX[0], dimX[1]))
+y = np.array(r.y)
+
+# split data
+# X_train, X_test, y_train, y_test = train_test_split(X, y, test_size = 0.25, random_state = 42)
+
+```
+
+### Baseline Model
+
+* Create a baseline model that classifies all results as 1 and measure the F1 score.
+
+```{python baseline score, echo=FALSE}
+
+# predict everything as late (1)
+baseline_preds = np.ones(len(y))
+
+# get f1 score
+baseline_f1score = f1_score(y, baseline_preds)
+
+# print score
+print(f"Baseline F1 score: {baseline_f1score:.4f}")
+
+```
+
+### Logistic Regression Model
+
+* Test the performance of a logistic regression model across the whole dataset.
+* We use cross-validation with 5-folds. 
+* Note we shuffle the data as the ordering is not arbitrary. 
+
+```{python logistic regression, echo=FALSE}
+
+# test performance of logistic regression classifier
+
+# setup model
+lreg_clf = linear_model.LogisticRegression()
+
+# compute cross-validated F1 scores using shuffled data
+cv = ShuffleSplit(n_splits = 5, test_size = 0.3, random_state = 42)
+lreg_scores = cross_val_score(lreg_clf, X, y, cv = cv, scoring = "f1")
+
+# print summary of scores
+print("%0.4f F1 score with a standard deviation of %0.3f" % (lreg_scores.mean(), lreg_scores.std()))
+
+```
+
+* Logistic regression clearly outperforms the baseline model.
+* We fit a logistic regression model to the whole dataset to produce our final predictive model.
+
+```{python final model, echo=FALSE}
+
+# fit final model using all data (performance estimate computed above)
+lreg_clf = linear_model.LogisticRegression().fit(X, y)
+
+```
+
+```{python decision tree and knn models, include=FALSE}
+
+# test performance of decision tree classifier
+
+# decision tree classifier
+dtree_clf = tree.DecisionTreeClassifier(random_state = 2)
+
+# compute cross-validated F1 scores
+dtree_scores = cross_val_score(dtree_clf, X, y, cv = cv, scoring = "f1")
+
+# print summary of scores
+print("%0.3f F1 score with a standard deviation of %0.3f" % (dtree_scores.mean(), dtree_scores.std()))
+
+# test performance of k-nearest neighbours classifier
+
+# setup model
+knn_clf = neighbors.KNeighborsClassifier()
+
+# compute cross-validated F1 scores
+knn_scores = cross_val_score(knn_clf, X, y, cv = cv, scoring = "f1")
+
+# print summary of scores
+print("%0.3f F1 score with a standard deviation of %0.3f" % (knn_scores.mean(), knn_scores.std()))
+
+```
+
+## Performance at True Parameters
+
+* We want to learn how this model performs on simulation data driven by the true parameters.
+* Firstly, run the simulation model using the estimated parameters (MLEs) `r n` times.
+* Test the final classification model on these datasets to learn about the variability in F1 scores.
+
+```{r load repeated MLE simulation results, echo=FALSE}
+
+# prep data for model fitting
+X_MLEs <- lapply(sim_MLEs_rep, function(x) x$state[-1:-burn, ])
+y_MLEs <- lapply(sim_MLEs_rep, function(x) x$time_in_system[-1:-burn])
+y_MLEs <- lapply(y_MLEs, function(x) as.numeric(x > threshold))
+
+# get dimensions
+MLEs_dims <- lapply(X_MLEs, dim)
+
+```
+
+```{python model scores on repeated MLE data, echo=FALSE}
+
+# load R data
+X_MLEs = r.X_MLEs
+y_MLEs = r.y_MLEs
+MLEs_dims = r.MLEs_dims
+
+# number of data sets
+n = int(r.n)
+
+# array to store metrics for each replication
+MLE_f1scores = np.empty((n, 1))
+
+# loop over replications
+for i in range(0, n):
+
+  # get data and reshape
+  X_temp = np.reshape(np.array(X_MLEs[i]), (MLEs_dims[i][0], MLEs_dims[i][1]))
+  y_temp = y_MLEs[i]
+
+  # get F1 score
+  MLE_f1scores[i, 0] = f1_score(y_temp, lreg_clf.predict(X_temp))
+
+```
+
+```{r model score analysis, echo=FALSE}
+
+# load data
+MLE_f1s <- data.frame("rep" = 1:n, "F1" = py$MLE_f1scores)
+
+# histogram
+hist <- ggplot(MLE_f1s, aes(x = F1))
+hist <- hist + geom_histogram(binwidth = 0.01, boundary = 0, col = "white", lwd = 0.25)
+hist <- hist + scale_x_continuous(breaks = seq(0.5, 0.9, by = 0.02))
+hist + ggtitle("Model performance on simulation data using the estimated parameters")
+
+```
+
+* Now run the simulation model `r n` times using the true parameters.
+* Compute the F1 score of our classification model on each simulation data set.
+* Compare performance of model on estimated parameters simulation data and true parameter simulation data.
+
+```{r load true parameter simulation results, echo=FALSE}
+
+# prep data for model fitting
+X_true <- lapply(sim_true_rep, function(x) x$state[-1:-burn, ])
+y_true <- lapply(sim_true_rep, function(x) x$time_in_system[-1:-burn])
+y_true <- lapply(y_true, function(x) as.numeric(x > threshold))
+
+# get dimensions
+true_dims <- lapply(X_true, dim)
+
+```
+
+```{python model scores on true parameter data, echo=FALSE}
+
+# load R data
+X_true = r.X_true
+y_true = r.y_true
+true_dims = r.true_dims
+
+# array to store F1 score for each replication
+true_f1scores = np.empty((n, 1))
+
+# loop over design points
+for i in range(0, n):
+
+  # get data and reshape
+  X_temp = np.reshape(np.array(X_true[i]), (true_dims[i][0], true_dims[i][1]))
+  y_temp = y_true[i]
+
+  # get F1 score
+  true_f1scores[i,0] = f1_score(y_temp, lreg_clf.predict(X_temp))
+
+```
+
+```{r true parameter model score analysis, echo=FALSE}
+
+# load data
+true_f1s <- data.frame("rep" = 1:n, "F1" = py$true_f1scores)
+
+# combine data
+f1s <- rbind(MLE_f1s, true_f1s)
+f1s$pars <- as.factor(rep(c("Estimated", "True"), each = n))
+
+# histogram
+hist <- ggplot(f1s, aes(x = F1, fill = pars))
+hist <- hist + geom_histogram(binwidth = 0.01, boundary = 0, col = "white",
+                              lwd = 0.25, alpha = 0.5, position = "identity")
+hist <- hist + scale_x_continuous(breaks = seq(0.71, 0.89, by = 0.02))
+hist + ggtitle("Model performance on estimated and true parameter simulation data")
+
+hist <- hist + scale_fill_discrete(name = "Parameters") + ylab("Count") + xlab("F1 Score") + theme(text = element_text(size = 15))
+
+```
+
+### Hypothesis Test
+
+* Hypothesis test to see whether there is a difference in model performance on simulation data from the estimated parameters versus simulation data from the true parameters.
+* Null hypothesis is that the two independent samples have the same mean, and alternative hypothesis is that they don't.
+* Use a two sample z-test, substituting the sample variances for the unknown population variances.
+
+```{r hypothesis test, echo=FALSE}
+
+# run t test
+# t.test(MLE_f1s$F1, true_f1s$F1, var.equal = FALSE)
+
+# run z test
+MLE_f1_sd <- sqrt(var(MLE_f1s$F1))
+z.test(MLE_f1s$F1, true_f1s$F1, sigma.x = MLE_f1_sd, sigma.y = sqrt(var(true_f1s$F1)))
+
+```
+
+* Very small p-value suggests there a significant difference in performance.
+* Decrease in performance under the true parameters, do we technically need to do a one-tailed test to determine this?
+
+## Experimental Design
+
+* True parameters are unknown, so consider how the model performs over some range of parameter values, determined by the input data.
+* Estimate parameter variance using observed Fisher information.
+* Use a full factorial design over the four input parameters.
+* Set upper and lower levels as MLEs plus/minus one standard deviation.
+* Run simulation using each design point `r n` times, and measure performance of classification model.
+
+```{r load design point simulation results, echo=FALSE}
+
+# prep data for model fitting
+X_dps <- lapply(sim_dps, function(x) lapply(x, function(y) y$state[-1:-burn, ]))
+y_dps <- lapply(sim_dps, function(x) lapply(x, function(y) y$time_in_system[-1:-burn]))
+y_dps <- lapply(y_dps, function(x) lapply(x, function(y) as.numeric(y > threshold)))
+
+# get dimensions
+dp_dims <- lapply(X_dps, function(x) lapply(x, dim))
+
+```
+
+```{python model scores on design point data, echo=FALSE}
+
+# load R data
+X_dps = r.X_dps
+y_dps = r.y_dps
+dp_dims = r.dp_dims
+
+# array to store metrics for each replication
+dp_f1scores = np.empty((n, len(X_dps)))
+
+# loop over design points
+for j in range(0, len(X_dps)):
+  
+  # subset data
+  X_dp_temp = X_dps[j]
+  y_dp_temp = y_dps[j]
+  dp_dims_temp = dp_dims[j]
+
+  # loop over replications
+  for i in range(0, n):
+  
+    # get data and reshape
+    X_temp = np.reshape(np.array(X_dp_temp[i]), (dp_dims_temp[i][0], dp_dims_temp[i][1]))
+    y_temp = y_dp_temp[i]
+  
+    # get F1 score
+    dp_f1scores[i,j] = f1_score(y_temp, lreg_clf.predict(X_temp))
+
+```
+
+```{r boxplot of F1 scores, echo=FALSE}
+
+# read in F1 scores
+dp_f1scores <- py$dp_f1scores
+
+# melt to data frame
+dp_f1scores_df <- reshape2::melt(dp_f1scores)
+colnames(dp_f1scores_df) <- c("rep", "dp", "F1")
+dp_f1scores_df$dp <- as.factor(dp_f1scores_df$dp)
+
+# boxplot
+bplot <- ggplot(dp_f1scores_df, aes(x = F1, y = dp))
+bplot <- bplot + geom_boxplot()
+bplot + ggtitle("Model performance on simulation data from design points")
+
+```
+
+```{r design point hypothesis testing, echo=FALSE}
+
+# vector to store p-values
+dp_pvals <- rep(0, d)
+
+# run t-test for each design point
+for(i in 1:d){
+  test <- z.test(MLE_f1s$F1, dp_f1scores[,i], sigma.x = MLE_f1_sd, sigma.y = sqrt(var(dp_f1scores[,i])))
+  dp_pvals[i] <- test$p.value
+}
+
+```
+
+* Run hypothesis test at each design point.
+* Tabulate design points, with mean and standard devation of F1 scores, and p-value.
+
+```{r ordered mean F1s, echo=FALSE}
+
+# combine design points, mean F1 score, sd F1 score, and p-value from t-test
+tab <- cbind(dps, colMeans(dp_f1scores), sqrt(apply(dp_f1scores, 2, var)), dp_pvals)
+
+# label
+colnames(tab) <- c("lambda", "mu1", "mu2", "mu3", "mean_F1", "sd_F1", "p-value")
+
+# view
+round(tab, 3)
+
+```
+
+* 14 design points with very small p-values, indicating significant difference in model performance.
+* 2 design points where model performance is similar to that on the MLE simulation data.
+
+```{r F1 and class balance correlation, include=FALSE}
+
+# are the changes in class balance affecting the F1 score?
+
+# check change in F1 score not correlated to class balances
+
+# get class 1 balances
+dp_balances <- lapply(y_dps, function(x) sapply(x, function(y) sum(y == 1) / length(y)))
+
+# measure correlations for each design point
+for(i in 1:d){
+  print(cor(dp_balances[[i]], dp_f1scores[,i]))
+}
+
+# doesn't appear so
+
+```
+
+* Fit linear regression model using input parameter values as predictor variables, and mean F1 score as the response.
+* Test model with and without interaction terms.
+
+```{r F1 sensitivity, echo=FALSE}
+
+# linear model with no interaction terms
+model <- lm(tab[, 5] ~ scale(tab[, 1:4]))
+sum_model <- summary(model)
+
+# fit linear model with interaction terms 
+int_model <- lm(tab[, 5] ~ .^2, data = as.data.frame(scale(tab[, 1:4])))
+sum_int_model <- summary(int_model)
+
+# get coefficients
+coefs <- data.frame("coef" = int_model$coefficients[2:10], "term" = as.factor(names(int_model$coefficients[2:10])))
+
+# bar plot
+lreg_coef_plt <- ggplot() + geom_col(data = coefs, aes(x = coef, y = term))
+lreg_coef_plt <- lreg_coef_plt + ylab("term") + xlab("coefficient")
+lreg_coef_plt <- lreg_coef_plt + scale_x_continuous(breaks = seq(-0.01, 0.025, by = 0.005))
+lreg_coef_plt + ggtitle("Mean F1 linear regression model coefficients")
+
+# create plot for thesis
+lreg_coef_plt <- lreg_coef_plt + ylab("Term") + xlab("Coefficient") + theme(text = element_text(size = 15))
+
+
+```
+
+* Interaction model has an R-squared score of `r round(sum_int_model$r.squared, 3)`.
+* Lambda has the largest coefficient by a fair way, followed by mu3, and then mu1, lambda:mu1 and lambda:mu3 which are all similar size.
+* Model without interaction terms has an R-squared score of `r round(sum_model$r.squared, 3)`.
+
+### Comparison to Mean Output
+
+* Fit a linear regression model using input parameter values as predictor variables, and the mean simulation output as the response.
+
+```{r mean output sensitivity, echo=FALSE}
+
+# compute mean outputs
+mean_outputs <- sapply(y_dps, function(x) mean(sapply(x, function(y) mean(y))))
+
+# mean output sensitivity
+int_model <- lm(mean_outputs ~ .^2, data = as.data.frame(scale(tab[, 1:4])))
+sum_int_model <- summary(int_model)
+
+# get coefficients
+coefs <- data.frame("coef" = int_model$coefficients[2:10], "term" = as.factor(names(int_model$coefficients[2:10])))
+
+# bar plot
+lreg_coef_plt <- ggplot() + geom_col(data = coefs, aes(x = coef, y = term))
+lreg_coef_plt <- lreg_coef_plt + ylab("term") + xlab("coefficient")
+lreg_coef_plt <- lreg_coef_plt + scale_x_continuous(breaks = seq(-0.06, 0.08, by = 0.02), limits = c(-0.06, 0.08))
+lreg_coef_plt + ggtitle("Mean output linear regression model coefficients")
+
+# create plot for thesis
+lreg_coef_plt <- lreg_coef_plt + ylab("Term") + xlab("Coefficient") + theme(text = element_text(size = 15))
+
+```
+
+* Model has an R-squared score of `r round(sum_int_model$r.squared, 3)`.
+* Again lambda of largest magnitude, however interactions seem less important here, as mu3 and mu1 next largest.
+* Direction and magnitude of coefficients do not align with mean F1 regression model, parameter values have different impact on performance of predictive model compared to impact on mean simulation output.
